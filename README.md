@@ -91,6 +91,27 @@ uv run merkle-audit schedule run [--once]
 ```
 `audit` sale con 0 (PASS), 1 (CORRUPT), 2 (INVALID) o 3 (INCOMPLETE).
 
+## Panel
+El panel (Streamlit) es la interfaz gráfica del auditor. Usa la misma lógica que el CLI y comparte con él el directorio del cliente: lo que se sube por uno se ve en el otro.
+
+1. En una terminal, el servidor: `make server` (o `uv run uvicorn merkle_audit.server.app:app`).
+2. En otra, el panel: `make ui` (o `uv run streamlit run src/merkle_audit/ui/app.py`). Abre `http://localhost:8501`.
+
+Sin el servidor encendido el panel arranca igual, pero la barra lateral avisa «Sin respuesta del servidor» y las auditorías terminan en `INCOMPLETE`.
+
+La barra lateral toma el directorio del cliente de `$MERKLE_AUDIT_HOME` (por defecto `./.merkle-audit-client/`) y el servidor de `$MERKLE_AUDIT_SERVER` (por defecto `http://127.0.0.1:8000`); ambos se pueden cambiar ahí mismo. También elige el archivo y la versión, y el tamaño del desafío.
+
+| Pestaña | Qué hace |
+|---|---|
+| Archivos | Sube un archivo, o una nueva versión del seleccionado (hasta 500 MB), y muestra su manifiesto |
+| Auditar | Elige `q` a mano o por objetivo (fracción dañada ε y probabilidad de detección), ejecuta la auditoría y muestra el estado, los hallazgos y el costo |
+| Probabilidad y costo | Curvas de detección según `q` para ε = 1, 5, 10 y 25 %, bytes de la respuesta frente a descargar el archivo, y la probabilidad de no detectar tras varias auditorías seguidas |
+| Historial | Conteo por estado, tabla de auditorías, y detalle con los índices consultados y la evidencia por índice; permite reverificar una respuesta guardada |
+| Programas | Crea, borra y ejecuta auditorías periódicas |
+
+Para probarlo: sube un archivo en «Archivos» y audítalo en «Auditar». Para ver una corrupción, daña ese archivo con `merkle-audit-fault` (ver «Servidor e inyector de fallos») y vuelve a auditar. Si solo quieres explorar el historial de la demo, ejecútala con `uv run python scripts/demo.py --keep` y pon la ruta del cliente que imprime en «Directorio del cliente».
+
+
 ## Demostración
 **Automática (≈30 s).** `make demo` levanta un servidor propio con directorios temporales y recorre los casos del enunciado con los mismos CLI de abajo. Cada paso declara el estado que espera y el script sale con código distinto de cero si alguno no coincide. Los datos son sintéticos y salen de `--seed` (por defecto 2026); con `--keep` los directorios quedan para abrirlos con `make ui`.
 
