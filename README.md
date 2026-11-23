@@ -2,6 +2,8 @@
 
 **Proyecto 7: auditor probabilístico de integridad para almacenamiento en la nube** con árboles de Merkle. Equipo 12, Criptografía Aplicada (Uninorte).
 
+Integrantes: Fatima Castro, Juan David Borja, Samuel Camargo
+
 ## Por dónde empezar
 1. [`docs/spec.md`](docs/spec.md): **el contrato**. Fija formatos, mensajes y reglas de rechazo. El código lo implementa byte a byte.
 2. [`informe/`](informe/): informe final (LaTeX).
