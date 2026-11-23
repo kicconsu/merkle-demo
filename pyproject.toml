@@ -1,0 +1,41 @@
+[project]
+name = "merkle-audit"
+version = "0.1.0"
+description = "Auditor probabilístico de integridad con árboles de Merkle (Equipo 12, Criptografía Aplicada)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "pydantic",
+    "streamlit",
+    "plotly",
+]
+
+[project.scripts]
+merkle-audit = "merkle_audit.client.cli:main"
+merkle-audit-fault = "merkle_audit.server.fault_cli:main"
+
+[dependency-groups]
+dev = ["pytest", "hypothesis", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/merkle_audit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["S101"]   # assert permitido en tests

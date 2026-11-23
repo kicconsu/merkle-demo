@@ -1,0 +1,574 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+% shorthands=off: con 'spanish', las comillas " son un atajo activo, y el texto las usa
+\usepackage[spanish,es-noquoting,es-tabla,shorthands=off]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs,tabularx,array}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{positioning,arrows.meta}
+\setlist{nosep,leftmargin=*}
+\captionsetup{font=small,labelfont=bf}
+\decimalpoint
+% \code{} no se divide; esto deja estirar los espacios antes que desbordar el margen
+\setlength{\emergencystretch}{2.5em}
+
+% Los datos de las figuras se leen directamente de los CSV versionados de los experimentos.
+% Se compila desde informe/ (latexmk) o desde la raíz del repo (Overleaf): se prueban ambas rutas.
+\IfFileExists{../experiments/results/costs.csv}
+  {\newcommand{\resultsdir}{../experiments/results}}
+  {\newcommand{\resultsdir}{experiments/results}}
+\pgfplotsset{
+  discard if not/.style 2 args={
+    x filter/.append code={
+      \edef\tempa{\thisrow{#1}}\edef\tempb{#2}
+      \ifx\tempa\tempb\else\def\pgfmathresult{inf}\fi
+    }
+  }
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\cause}[1]{\texttt{\small #1}}
+\newcommand{\Hash}{\mathsf{H}}
+\newtheorem{proposicion}{Proposición}
+
+\title{\textbf{Auditor probabilístico de integridad para almacenamiento en la nube}\\[2pt]
+\large Proyecto 7 · Informe final (E2) · Criptografía Aplicada, Uninorte}
+\author{Equipo 12: Samuel Camargo Consuegra, Fátima Castro Castro, Juan David Borja Cantillo}
+\date{Noviembre de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Construimos un auditor que comprueba, sin descargar el archivo, si un servidor conserva sus bloques.
+El cliente guarda una huella pequeña y autenticada del archivo (el manifiesto) y envía desafíos con
+índices aleatorios; el servidor responde con esos bloques y sus caminos en un árbol de Merkle con
+SHA-256 y separación de dominios. Si $d$ de los $n$ bloques están dañados, una auditoría de $q$
+índices lo detecta con una probabilidad exacta $P(n,d,q)$ que depende solo de $n$, $d$ y $q$; en 28
+combinaciones de daño y tamaño de desafío, con 1000 repeticiones cada una, la tasa observada fue
+compatible con esa fórmula en todas. El producto es un auditor por muestreo y no una prueba de
+recuperabilidad: un PASS solo dice algo de los bloques consultados.
+\end{abstract}
+
+% ------------------------------------------------------------------------------------------------
+\section{Qué garantiza el sistema y qué no}
+\label{sec:garantia}
+
+El enunciado pide presentar el producto como auditor basado en muestreo y no como prueba formal de
+que el archivo es recuperable. Fijamos la garantía en una sola frase, que es la que implementa y
+prueba el código:
+
+\begin{quote}
+\emph{Si una auditoría termina en PASS, entonces, salvo una colisión de SHA-256, cada uno de los $q$
+bloques consultados es idéntico al bloque de esa posición en la versión del archivo comprometida en
+el manifiesto. Si el servidor no puede entregar correctos $d$ de los $n$ bloques, una auditoría lo
+detecta con probabilidad $P(n,d,q)$.}
+\end{quote}
+
+\noindent No se garantiza: (i) que el archivo completo esté disponible o sea recuperable, porque no
+hay extractor, códigos de borrado ni autenticadores homomórficos como en los PoR de Juels-Kaliski
+\cite{jk07} y Shacham-Waters \cite{sw08}; (ii) nada sobre los bloques no consultados; (iii) que los
+datos sigan intactos después de la última auditoría; (iv) disponibilidad ni tiempo de respuesta
+(un timeout da INCOMPLETE y no cuenta como evidencia); (v) confidencialidad, pues los bloques viajan
+en claro; y (vi) que el servidor guarde los datos él mismo y no los traiga de otra fuente al
+responder. La E1 listaba como propiedades \emph{soundness \& extractability}, cifrado de bloques y
+sobrecosto de almacenamiento por códigos de redundancia; las quitamos porque el producto no las da
+(sección~\ref{sec:desviaciones}).
+
+% ------------------------------------------------------------------------------------------------
+\section{Modelo de adversario}
+\label{sec:adversario}
+
+\paragraph{Adversario.} El servidor es malicioso y adaptativo y controla el canal. Puede borrar,
+modificar, truncar, reordenar o reemplazar bloques y nodos del árbol; conservar versiones anteriores
+y responder con ellas; responder con caminos de otro índice, respuestas parciales, duplicadas o de
+una auditoría anterior; y ver todos los desafíos pasados antes de decidir qué datos conservar.
+
+\paragraph{Suposiciones.} (S1) SHA-256 es resistente a colisiones (Boneh-Shoup, Def.~8.1
+\cite{bs23}). (S2) HMAC-SHA256 es un MAC seguro con la clave local del cliente. (S3) Los índices
+salen de un CSPRNG (\code{secrets.SystemRandom}) y el servidor no los predice antes de recibir el
+desafío. (S4) La máquina del cliente es confiable: manifiesto, clave y bitácora juegan el papel de
+la memoria de solo lectura de Boneh-Shoup §8.1. (S5) La carga inicial ocurre con el servidor honesto.
+
+\paragraph{Fuera del modelo.} Denegación de servicio, un servidor que recupera los datos de otra
+fuente al responder, canales laterales, un cliente comprometido y fallos del cliente durante la carga.
+
+% ------------------------------------------------------------------------------------------------
+\section{Diseño criptográfico}
+\label{sec:diseno}
+
+Todos los parámetros están fijados en un solo módulo (\code{core/params.py}) y en el documento
+normativo \code{docs/spec.md}, que el código implementa byte a byte.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Prefijo & Función & Entrada a $\Hash$ & Bytes \\
+\midrule
+\code{0x00} & $\mathsf{leaf}(i,x)$ & $\code{0x00}\,\|\,u_{64}(i)\,\|\,u_{64}(|x|)\,\|\,x$ & $17+|x|$ \\
+\code{0x01} & $\mathsf{node}(l,r)$ & $\code{0x01}\,\|\,l\,\|\,r$ & 65 \\
+\code{0x02} & $\mathsf{EMPTY\_ROOT}$ & $\code{0x02}\,\|\,\texttt{"empty"}$ & 6 \\
+\code{0x03} & $\mathsf{commit}$ & $\code{0x03}\,\|\,\mathit{fid}\,\|\,u_{64}(v)\,\|\,u_{64}(B)\,\|\,u_{64}(S)\,\|\,u_{64}(n)\,\|\,\mathit{root}$ & 81 \\
+\bottomrule
+\end{tabular}
+\caption{Funciones con separación de dominios. $\Hash$ es SHA-256 y $u_{64}$, un entero sin signo de
+8 bytes big-endian. Es la única definición de hoja del sistema.}
+\label{tab:dominios}
+\end{table}
+
+\subsection{Bloques, árbol y compromiso}
+El archivo de $S$ bytes se parte en $n=\lceil S/B\rceil$ bloques, con $B\in\{4,8,16,32,64\}$~KiB y
+$S\le 500$~MiB. El último bloque es corto y \emph{no se rellena}: su longitud real entra en la hoja.
+Cada nivel se forma con $\mathsf{node}$ sobre pares consecutivos; si el nivel es impar, el último
+nodo \emph{se promueve} sin volver a aplicar el hash, que es la regla del Ejercicio 8.9 de
+Boneh-Shoup (figura~\ref{fig:arbol}). Para $n=0$ la raíz es $\mathsf{EMPTY\_ROOT}$. La huella del
+archivo es el compromiso
+\[
+C=\mathsf{commit}(\mathit{file\_id}, v, B, S, n, \mathit{root}),
+\]
+que generaliza la raíz final $h(\textit{raíz}\,\|\,s)$ de ese ejercicio: además de $n$ liga el
+archivo, la versión y los parámetros. El \code{file\_id} son 16 bytes aleatorios fijos entre
+versiones y $v\ge 1$ crece de uno en uno.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  every node/.style={draw,rounded corners=2pt,font=\footnotesize,minimum height=5mm,inner sep=2pt},
+  lv/.style={draw=none,font=\scriptsize\itshape,text=gray},
+  level distance=10mm]
+\node (l0) at (0,0) {$\ell_0$}; \node (l1) at (1.4,0) {$\ell_1$};
+\node (l2) at (2.8,0) {$\ell_2$}; \node (l3) at (4.2,0) {$\ell_3$};
+\node[fill=yellow!25] (l4) at (5.6,0) {$\ell_4$};
+\node (a) at (0.7,1.1) {$\mathsf{node}(\ell_0,\ell_1)$};
+\node (b) at (3.5,1.1) {$\mathsf{node}(\ell_2,\ell_3)$};
+\node[fill=yellow!25] (c) at (5.6,1.1) {$\ell_4$};
+\node (d) at (2.1,2.2) {$\mathsf{node}(a,b)$};
+\node[fill=yellow!25] (e) at (5.6,2.2) {$\ell_4$};
+\node[fill=blue!10] (r) at (3.85,3.3) {$\mathit{root}=\mathsf{node}(d,\ell_4)$};
+\draw (l0)--(a); \draw (l1)--(a); \draw (l2)--(b); \draw (l3)--(b);
+\draw[dashed] (l4)--(c); \draw (a)--(d); \draw (b)--(d); \draw[dashed] (c)--(e);
+\draw (d)--(r); \draw (e)--(r);
+\node[lv] at (8.2,1.1) {$\ell_4$ se promueve};
+\node[lv] at (8.2,2.2) {y otra vez};
+\end{tikzpicture}
+\caption{Árbol para $n=5$. El nodo sin hermano sube tal cual (línea discontinua). El camino de
+$\ell_4$ tiene un solo hash ($d$), y su forma la calcula el verificador a partir de $(4,5)$.}
+\label{fig:arbol}
+\end{figure}
+
+\subsection{Pruebas de inclusión}
+El camino de la hoja $i$ es la lista de hashes hermanos desde la hoja hacia la raíz. \emph{La
+dirección de cada hermano se deriva de $(i,n)$ y nunca del servidor}: la función
+$\mathsf{path\_shape}(i,n)$ recorre los niveles y, en cada uno, devuelve LEFT si el índice actual es
+impar, RIGHT si tiene hermano a la derecha, o nada si el nodo se promueve. Verificar un bloque
+consiste en (1) comprobar $|x|=L(i)$, donde $L(i)=B$ salvo el último bloque, (2) comprobar que el
+camino tiene la longitud que da $\mathsf{path\_shape}$, (3) recomputar la raíz desde
+$\mathsf{leaf}(i,x)$ y (4) compararla en tiempo constante con la del manifiesto. Cada paso tiene su
+causa de rechazo (\cause{BLOCK\_LENGTH}, \cause{PATH\_LENGTH}, \cause{ROOT\_MISMATCH}).
+
+\subsection{Por qué la codificación es inequívoca}
+La raíz funciona como un \emph{commitment} del archivo, y el binding por resistencia a colisiones
+exige una codificación inequívoca de lo que se compromete (\cite{vp}, pág.~49--52). Lo
+justificamos así: hojas y nodos internos se distinguen por el primer byte, como en Certificate Transparency \cite{rfc9162}; posición y longitud entran
+con ancho fijo, de modo que el mismo contenido en otra posición, o el mismo bloque con ceros
+añadidos, dan hojas distintas; la forma del árbol depende solo de $n$, que está ligado en $C$, y el
+verificador nunca toma del servidor qué hash va a cada lado; y $\mathsf{commit}$ liga
+$\mathit{file\_id}$, $v$, $B$, $S$ y $n$ con anchos fijos.
+
+\begin{proposicion}
+Si un servidor produce, para un índice $i$ consultado, un par $(x',\pi')$ con $x'\ne x_i$ que pasa
+la verificación contra la raíz del manifiesto, entonces se puede extraer una colisión de SHA-256.
+\end{proposicion}
+\noindent\emph{Idea de la prueba.} Es el argumento de Boneh-Shoup, Thm~8.8, adaptado al árbol del
+Ej.~8.9. Como la forma del camino depende solo de $(i,n)$, la recomputación honesta y la falsa
+recorren las mismas posiciones. Como ambas terminan en la misma raíz y empiezan en entradas
+distintas ($\code{0x00}\|u_{64}(i)\|u_{64}(|x'|)\|x' \ne \code{0x00}\|u_{64}(i)\|u_{64}(|x_i|)\|x_i$),
+existe un primer nivel en que las salidas de $\Hash$ coinciden y las entradas difieren, y eso es una
+colisión. Los prefijos impiden que una hoja se haga pasar por nodo interno o viceversa. \hfill$\square$
+
+\subsection{Manifiesto autenticado}
+El manifiesto guarda \code{file\_id}, versión, nombre, $S$, $B$, $n$, raíz, $C$ y fecha, serializados
+como JSON canónico (claves ordenadas, sin espacios, solo ASCII), y lleva un HMAC \cite{rfc2104}
+\[
+\mathit{mac}=\mathrm{HMAC\text{-}SHA256}\bigl(K,\ \texttt{"merkle-audit/manifest/1"}\,\|\,\code{0x00}\,\|\,\mathsf{canon}(m)\bigr)
+\]
+con una clave $K$ de 32 bytes que se crea en el primer uso con permisos \code{0600} y nunca se
+registra. Antes de cada auditoría se valida en orden: forma, MAC (con
+\code{hmac.compare\_digest}), coherencia de parámetros y compromiso. Si algo falla, la auditoría es
+INVALID y \emph{no se envía el desafío}. El cliente no conserva el archivo después de la carga: el
+manifiesto es todo lo que tiene.
+
+\subsection{Frescura y ligadura al contexto}
+Cada auditoría usa un \code{audit\_id} nuevo de 128 bits y $q$ índices distintos, elegidos sin
+reemplazo con el generador criptográfico del sistema (\code{secrets.SystemRandom}). La respuesta debe repetir \code{audit\_id}, \code{file\_id} y
+versión, y traer exactamente los índices pedidos en el mismo orden; si no, es INVALID. Con eso una
+respuesta de otra auditoría, de otro archivo o de otra versión no se acepta
+(\cite{vp}, págs.~43 y 142). Un rollback que dice la versión vieja se rechaza por
+\cause{VERSION\_MISMATCH}; uno que miente y dice la versión pedida falla por \cause{ROOT\_MISMATCH},
+porque sus bloques no coinciden con la raíz comprometida en $C$.
+
+% ------------------------------------------------------------------------------------------------
+\section{Protocolo}
+\label{sec:protocolo}
+
+El transporte es HTTP local (FastAPI y httpx). La versión del protocolo va en el cuerpo
+(\code{"protocol": "merkle-audit/1"}); los modelos de mensaje rechazan campos de más o de menos y
+conversiones implícitas de tipos. Hashes e identificadores van en hex en minúsculas de longitud
+exacta y los bloques en base64 estricto.
+
+\paragraph{Carga.} \code{PUT /files/\{file\_id\}/versions/\{v\}} con el archivo crudo. El servidor
+guarda bloques, niveles del árbol y una copia íntegra (para que el inyector pueda restaurar), y
+responde con un recibo que trae $n$, raíz y $C$. El cliente calcula su propio árbol mientras envía y
+solo crea el manifiesto si el recibo coincide. Las versiones son inmutables y consecutivas.
+
+\paragraph{Auditoría.} \code{POST /audit} con el desafío
+$(\mathit{audit\_id},\mathit{file\_id},v,C,\mathit{indices})$; la respuesta trae una prueba
+$(i, x_i, \pi_i)$ por índice, o \code{block: null} si el servidor declara que no tiene ese bloque.
+El servidor lee los caminos de los niveles guardados en la carga, no los recalcula, de modo que un
+bloque alterado en disco aparece como \cause{ROOT\_MISMATCH} y no como un camino coherente con la
+alteración.
+
+\paragraph{Estados.} La evaluación sigue un orden fijo: validar el manifiesto; enviar y esperar
+(timeout de 60~s configurable); validar estructura y ligadura de la respuesta (el primer fallo da
+INVALID y no se verifica ninguna prueba); y verificar \emph{todas} las pruebas sin parar en la
+primera que falla, para reportar cada índice dañado. El código HTTP acompaña pero no decide: el
+veredicto sale del cuerpo. La tabla~\ref{tab:estados} resume los cuatro estados y las 16 causas, que
+forman una lista cerrada.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}l>{\raggedright\arraybackslash}Xc@{}}
+\toprule
+Estado & Causas & ¿Detección? \\
+\midrule
+PASS & --- (con $n=0$ se marca \emph{trivial}) & No \\
+CORRUPT & \cause{BLOCK\_MISSING}, \cause{BLOCK\_LENGTH}, \cause{PATH\_LENGTH}, \cause{ROOT\_MISMATCH},
+  \cause{FILE\_MISSING} & Sí \\
+INVALID & \cause{MANIFEST\_FORMAT}, \cause{MANIFEST\_MAC}, \cause{MANIFEST\_COMMITMENT},
+  \cause{MALFORMED}, \cause{AUDIT\_ID\_MISMATCH}, \cause{FILE\_ID\_MISMATCH},
+  \cause{VERSION\_MISMATCH}, \cause{INDEX\_SET\_MISMATCH}, \cause{SERVER\_ERROR} & Sí \\
+INCOMPLETE & \cause{TIMEOUT}, \cause{CONNECTION} & No \\
+\bottomrule
+\end{tabularx}
+\caption{Estados de una auditoría y lista cerrada de causas. INVALID cuenta como detección porque el
+servidor no cumplió el protocolo; INCOMPLETE no aporta evidencia en ningún sentido.}
+\label{tab:estados}
+\end{table}
+
+% ------------------------------------------------------------------------------------------------
+\section{Modelo probabilístico}
+\label{sec:prob}
+
+Si $d$ de los $n$ bloques están dañados y se consultan $q$ índices uniformes sin reemplazo, la
+auditoría no ve ninguno dañado con probabilidad $\binom{n-d}{q}/\binom{n}{q}$, así que
+\[
+P(n,d,q)=1-\frac{\binom{n-d}{q}}{\binom{n}{q}}=1-\prod_{j=0}^{q-1}\frac{n-d-j}{n-j},
+\]
+con $P=0$ si $d=0$ o $q=0$, y $P=1$ si $q>n-d$. La fórmula es exacta en este modelo porque el
+servidor fija qué bloques pierde antes de ver el desafío y no puede predecirlo (S3). El código usa
+la forma de producto en coma flotante; los tests la comparan con \code{math.comb} y
+\code{fractions.Fraction} para $n\le 2000$. La expresión $1-(1-\varepsilon)^q$ de la E1 corresponde al
+muestreo \emph{con} reemplazo y solo la usamos como comparación.
+
+\paragraph{Elección de $q$.} $q_{\min}(n,d,1-\delta)$ es el menor $q$ con $P\ge 1-\delta$; como $P$
+crece con $q$, se halla por bisección. Por defecto el objetivo es detectar $\varepsilon=1$\,\% con
+99~\%. Para $n=10\,000$ eso da $q=448$ ($P=99{,}002$\,\%), frente a 459 con la aproximación. El valor
+casi no depende de $n$: 368 para $n=1000$, 455 para $n=25\,600$ (100~MiB con bloques de 4~KiB) y
+458 para el máximo, $n=128\,000$. Con $Q_{\max}=1024$ todos caben en una respuesta.
+
+\paragraph{Repetición y límites.} Con $k$ auditorías independientes y daño estático, la probabilidad
+de no detectar es $(1-P)^k$. Esto no prueba disponibilidad: el daño puede ocurrir después de la
+última auditoría; un daño de un solo bloque se ve por auditoría con probabilidad $q/n$ (4,5~\% con
+$q=448$ y $n=10\,000$); y los bloques nunca consultados no tienen ninguna garantía. La demostración
+reproducible muestra justamente este caso: un bloque modificado en un archivo de 2048 bloques suele
+pasar una auditoría con $q=300$.
+
+% ------------------------------------------------------------------------------------------------
+\section{Implementación}
+\label{sec:impl}
+
+El código (Python 3.12, dependencias fijadas con \code{uv.lock}) se organiza en capas con una regla
+de dependencias estricta, $\code{core}\leftarrow\code{protocol}\leftarrow\{\code{client},\code{server}\}\leftarrow\code{ui}$,
+como pide el enunciado:
+
+\begin{itemize}
+\item \code{core}: primitivas puras sin red ni disco: codificación, árbol, manifiesto y probabilidad.
+\item \code{protocol}: mensajes (pydantic, \code{extra="forbid"}, modo estricto), generación de
+  desafíos y evaluación de respuestas.
+\item \code{server}: API FastAPI y almacén SQLite (bloques, niveles, copia íntegra y fallos, en modo
+  WAL), más el inyector de fallos \code{merkle-audit-fault}, un CLI sin endpoint de red que escribe
+  en el almacén del servidor y nunca en el cliente. Implementa borrado, modificación (bit invertido o
+  truncado), reemplazo, camino cruzado, rollback declarado o mentido, daño de una fracción $\varepsilon$,
+  pérdida del archivo y restauración; cada aplicación queda registrada con su semilla.
+\item \code{client}: CLI \code{merkle-audit} (\code{upload}, \code{audit}, \code{reverify},
+  \code{log}, \code{schedule}), transporte httpx, almacén de manifiestos y clave, programador de
+  auditorías periódicas y la bitácora.
+\item \code{ui}: panel Streamlit con las curvas de probabilidad y de costo en función de $q$, el
+  historial con la evidencia de cada auditoría y los programas.
+\end{itemize}
+
+\paragraph{Bitácora.} Cada auditoría queda en una tabla SQLite \emph{solo de inserción} (dos
+triggers impiden \code{UPDATE} y \code{DELETE}) con identidad, parámetros, la lista completa de
+índices, el estado y las causas, la evidencia por índice (hoja y raíz recomputadas en hex), el
+SHA-256 del cuerpo de la respuesta, latencia, bytes y tiempo de verificación, y $P(n,d,q)$ para
+$\varepsilon\in\{1,5,10,25\}$\,\%. No se guardan bloques ni la clave. Con \code{-{}-keep-responses}
+se guarda la respuesta cruda y \code{reverify} repite la verificación; esta opción es solo para datos
+sintéticos.
+
+\paragraph{Aleatoriedad en los experimentos.} Solo el código de \code{experiments/} puede usar como fuente
+de índices un generador con semilla (\code{random.Random}), para que los resultados se puedan repetir. El
+CLI y el panel no exponen esa opción.
+
+% ------------------------------------------------------------------------------------------------
+\section{Pruebas}
+\label{sec:pruebas}
+
+La suite tiene 295 tests (\code{make check} corre lint y tests; uno se omite en Windows porque
+comprueba permisos POSIX): 153 unitarios, 68 de ataques y 74 de integración. Cada regla de rechazo
+tiene su test en \code{tests/adversarial/}; los de integración prueban cliente y servidor reales de
+punta a punta y la demostración completa. La tabla~\ref{tab:pruebas} resume la trazabilidad.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+Requisito o causa & Test \\
+\midrule
+Vectores de la spec (vacío, 1 byte, 3 bloques) & \code{unit/test\_vectors.py} \\
+Forma del camino: verifica para todo $i<n\le 300$ (hypothesis) & \code{unit/test\_merkle.py} \\
+$P$ exacta y $q_{\min}$ & \code{unit/test\_probability.py} \\
+Archivos intactos, vacíos y de tamaño no múltiplo de $B$ & \code{integration/test\_server\_api.py}, \code{test\_client.py} \\
+\cause{MANIFEST\_FORMAT}, \cause{MANIFEST\_MAC}, \cause{MANIFEST\_COMMITMENT} & \code{adversarial/test\_manifest\_tampering.py} \\
+\cause{MALFORMED} (19 casos de esquema, hex y base64) & \code{adversarial/test\_malformed.py} \\
+\cause{AUDIT\_ID\_MISMATCH} (replay), \cause{FILE\_ID\_MISMATCH} & \code{test\_replay.py}, \code{test\_binding.py} \\
+\cause{VERSION\_MISMATCH}, rollback mentido & \code{adversarial/test\_rollback.py} \\
+\cause{INDEX\_SET\_MISMATCH}: falta, sobra, duplicado, ajeno, orden & \code{adversarial/test\_index\_set.py} \\
+\cause{BLOCK\_MISSING}, \cause{BLOCK\_LENGTH}, \cause{ROOT\_MISMATCH} & \code{test\_delete.py}, \code{test\_modify.py}, \code{test\_replace.py} \\
+Camino cruzado (\cause{ROOT\_MISMATCH} / \cause{PATH\_LENGTH}) & \code{adversarial/test\_cross\_path.py} \\
+\cause{SERVER\_ERROR}, \cause{FILE\_MISSING} & \code{adversarial/test\_server\_errors.py} \\
+\cause{TIMEOUT}, \cause{CONNECTION}; manifiesto alterado sin enviar el desafío & \code{integration/test\_client.py} \\
+Bitácora solo de inserción, programador, \code{reverify} & \code{integration/test\_client.py} \\
+\bottomrule
+\end{tabularx}
+\caption{Trazabilidad de requisitos y causas a pruebas automatizadas (rutas bajo \code{tests/}).}
+\label{tab:pruebas}
+\end{table}
+
+Además, \code{make demo} recorre con los CLI reales los casos del enunciado (intacto, vacío, tamaño
+impar, borrado, modificación, reemplazo, camino cruzado, rollback declarado y mentido, pérdida del
+archivo, manifiesto alterado, reverificación y servidor caído), declara el estado que espera en cada
+paso y termina con error si alguno no coincide. En la última ejecución, los 20 pasos salieron como se
+esperaba.
+
+% ------------------------------------------------------------------------------------------------
+\section{Experimentos}
+\label{sec:exp}
+
+Los scripts de \code{experiments/} son reproducibles con semilla (2026 por defecto) y escriben CSV
+que se versionan; las figuras y tablas de esta sección se generan directamente de esos CSV al compilar.
+
+\subsection{Detección: empírica frente a teórica}
+\paragraph{Diseño.} Archivo sintético de $n=1000$ bloques de 4~KiB. Para cada
+$\varepsilon\in\{1,5,10,25\}$\,\% se dañan $d=\lceil\varepsilon n\rceil$ bloques (un bit invertido)
+y para cada $q\in\{5,10,25,50,100,200,300\}$ se hacen $N=1000$ auditorías con índices nuevos. El
+servidor simulado conserva el árbol original y cada respuesta pasa por la misma evaluación del
+cliente; cuenta como detección toda auditoría que no termina en PASS. Una combinación se acepta si
+$P(n,d,q)$ cae dentro del intervalo de Wilson \cite{wilson} al 99~\% de la tasa observada $\hat p$.
+
+\paragraph{Resultado.} Las 28 combinaciones quedan dentro de su intervalo
+(figura~\ref{fig:deteccion}). Con 28 pruebas al 99~\% se esperaban en promedio 0,3 fuera, así que el
+resultado es el esperable. Un ejemplo: con $\varepsilon=1$\,\% y $q=100$, $\hat p=0{,}665$ frente a
+$P=0{,}653$, con intervalo $[0{,}626;\ 0{,}702]$. La E1 usaba una tolerancia fija de $\pm1{,}5$\,\%,
+que en ese punto es apenas una desviación estándar y habría rechazado cerca de un tercio de las
+combinaciones correctas.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.86\linewidth, height=6.2cm,
+  xmode=log, log basis x=10,
+  xtick={5,10,25,50,100,200,300}, xticklabels={5,10,25,50,100,200,300},
+  xlabel={$q$ (bloques consultados), $n=1000$}, ylabel={probabilidad de detección},
+  ymin=0, ymax=1.03, grid=major, grid style={gray!20},
+  legend pos=south east, legend cell align=left, legend style={font=\scriptsize},
+  cycle list={{blue!70!black},{teal!70!black},{orange!85!black},{red!75!black}},
+]
+\foreach \e in {0.01, 0.05, 0.1, 0.25} {
+  \edef\tmp{
+    \noexpand\addplot+[no marks, thick, discard if not={eps}{\e}]
+      table[x=q, y=exact, col sep=comma] {\resultsdir/detection.csv};
+  }\tmp
+}
+\legend{$\varepsilon=1$\,\%, $\varepsilon=5$\,\%, $\varepsilon=10$\,\%, $\varepsilon=25$\,\%}
+\foreach \e in {0.01, 0.05, 0.1, 0.25} {
+  \edef\tmp{
+    \noexpand\addplot+[only marks, mark=*, mark size=1.4pt, black, forget plot,
+      discard if not={eps}{\e},
+      error bars/.cd, y dir=both, y explicit]
+      table[x=q, y=empirical, col sep=comma,
+        y error plus expr=\noexpand\thisrow{wilson99_high}-\noexpand\thisrow{empirical},
+        y error minus expr=\noexpand\thisrow{empirical}-\noexpand\thisrow{wilson99_low}]
+      {\resultsdir/detection.csv};
+  }\tmp
+}
+\end{axis}
+\end{tikzpicture}
+\caption{Probabilidad exacta $P(n,d,q)$ (líneas) y tasa observada en 1000 auditorías (puntos) con su
+intervalo de Wilson al 99~\%. Datos: \code{experiments/results/detection.csv}.}
+\label{fig:deteccion}
+\end{figure}
+
+\subsection{Costos}
+\paragraph{Diseño.} Para archivos de 1, 10 y 100~MiB y bloques de 4, 16 y 64~KiB se construye el
+árbol, se elige $q_{\min}$ para detectar $\varepsilon=1$\,\% con 99~\% y se mide una auditoría honesta
+completa: bytes del desafío y de la respuesta (JSON tal como viaja), tiempo de verificación y
+cociente frente a descargar el archivo. Los tiempos son la mediana de 5 repeticiones en una máquina
+de desarrollo y solo sirven para comparar entre sí.
+
+\begin{table}[ht]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\pgfplotstabletypeset[
+  col sep=comma,
+  columns={file_mib,block_size,n,tree_levels,build_ms,q,avg_path_hashes,audit_bytes,bandwidth_ratio,verify_ms},
+  columns/file_mib/.style={column name={MiB}, fixed, precision=0},
+  columns/block_size/.style={column name={$B$ (KiB)}, preproc/expr={##1/1024}, fixed, precision=0},
+  columns/n/.style={column name={$n$}, int detect, 1000 sep={\,}},
+  columns/tree_levels/.style={column name={niv.}},
+  columns/build_ms/.style={column name={árbol ms}, fixed, precision=0},
+  columns/q/.style={column name={$q$}},
+  columns/avg_path_hashes/.style={column name={hashes}, fixed, precision=1, zerofill},
+  columns/audit_bytes/.style={column name={MB},
+    preproc/expr={##1/1000000}, fixed, precision=2, zerofill},
+  columns/bandwidth_ratio/.style={column name={cociente}, fixed, precision=2, zerofill},
+  columns/verify_ms/.style={column name={verif. ms}, fixed, precision=0},
+  every head row/.style={before row=\toprule, after row=\midrule},
+  every last row/.style={after row=\bottomrule},
+  every nth row={3}{before row=\midrule},
+]{\resultsdir/costs.csv}
+\caption{Costo de una auditoría con $q_{\min}$ para $\varepsilon=1$\,\% y 99~\%. «niv.»: niveles del
+árbol; «hashes»: longitud media del camino; «MB»: desafío más respuesta; «cociente»: MB de la
+auditoría entre el tamaño del archivo; tiempos en ms. Datos: \code{experiments/results/costs.csv}.}
+\label{tab:costos}
+\end{table}
+
+\paragraph{Resultado.} La tabla~\ref{tab:costos} muestra tres hechos. Primero, como $q_{\min}$ casi
+no crece con $n$, el costo de auditar es casi constante y la ventaja frente a descargar crece con el
+archivo: con 100~MiB y bloques de 4~KiB una auditoría mueve unos 3~MB, el 2,8~\% del archivo.
+Segundo, en archivos pequeños el muestreo no ahorra nada: con 1~MiB hay que consultar 201 de 256
+bloques y, por el 33~\% de base64 y los caminos, la auditoría cuesta más que el archivo (cociente
+1,16). Para esos tamaños, descargar y comparar con la raíz es más barato y da certeza. Tercero, el
+tamaño de bloque domina el ancho de banda: con 64~KiB el camino es más corto pero cada bloque
+consultado pesa 16 veces más, y en 100~MiB la auditoría pasa del 2,8~\% al 34~\% del archivo. Por eso
+dejamos 4~KiB por defecto. Construir el árbol cuesta del orden de 3~ms por MiB y verificar una
+auditoría, menos de un segundo en todos los casos medidos.
+
+% ------------------------------------------------------------------------------------------------
+\section{Desviaciones respecto a la propuesta (E1)}
+\label{sec:desviaciones}
+
+El enunciado permite corregir el diseño inicial siempre que se expliquen las desviaciones. Cada
+cambio se justifica con las correcciones dadas por el docente y con el texto; la tabla~\ref{tab:desv} resume los
+que alteran lo propuesto en la E1, incluidos los que señaló la evaluación.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.27\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+E1 & E2 y motivo \\
+\midrule
+Propiedades: \emph{soundness \& extractability}, cifrado de bloques, sobrecosto por redundancia &
+Se quitan. El producto es un auditor por muestreo; los PoR quedan como estado del arte
+(sección~\ref{sec:garantia}). \\
+Dos definiciones de hoja: $\Hash(\code{0x00}\|i\|\,|x_i|\,\|x_i)$ y $h(x_i)$ &
+Una sola $\mathsf{leaf}(i,x)$ con anchos fijos $u_{64}$, en cliente, servidor, tests e informe. \\
+Nivel impar «por ejemplo, promover»; último bloque con ceros &
+Promoción sin rehash (Ej.~8.9) y último bloque corto sin relleno: con ceros, un archivo y el mismo
+con ceros añadidos tenían la misma raíz. \\
+Archivo vacío: «error o hash nulo» & $\mathsf{EMPTY\_ROOT}$ con dominio propio y auditoría con $q=0$
+que pasa de forma trivial y lo dice. \\
+Raíz sola como huella & Compromiso $C$ con prefijo \code{0x03} que liga archivo, versión,
+parámetros y $n$. \\
+Manifiesto alterado detectado porque «las pruebas no cuadran» & HMAC-SHA256 sobre JSON canónico:
+se rechaza antes de enviar el desafío. \\
+Camino sin dirección & La dirección sale de $(i,n)$, nunca del servidor. \\
+Índices con «secrets / random» & Solo \code{secrets.SystemRandom}; \code{random} con semilla, solo
+en experimentos. \\
+Respuestas en «lotes 1..K» sin formato & Una respuesta por desafío con $Q_{\max}=1024$, y reglas
+cerradas para falta, sobra, duplicado, ajeno y orden. \\
+Comparación con $1-(1-\varepsilon)^q$ y tolerancia $\pm1{,}5$\,\% & Probabilidad exacta
+hipergeométrica, $q_{\min}$ por bisección y criterio de Wilson al 99~\%. \\
+Ejemplo con $n=10^6$ bloques & Imposible con 500~MB y 4~KiB: el máximo es $n=128\,000$, con caminos de a lo sumo 17 hashes. \\
+\bottomrule
+\end{tabularx}
+\caption{Desviaciones entre la propuesta (E1) y la implementación (E2).}
+\label{tab:desv}
+\end{table}
+
+Además decidimos durante la implementación, sin cambiar nada de la E1: SHA-256 como único hash, sin
+negociación; rutas HTTP sin prefijo de versión (la versión va en el cuerpo); códigos HTTP fijos con
+el cuerpo como única fuente de verdad; versiones consecutivas; y caminos leídos de los niveles
+guardados en la carga, no recalculados.
+
+% ------------------------------------------------------------------------------------------------
+\section{Limitaciones y trabajo futuro}
+\label{sec:limites}
+
+\begin{itemize}
+\item \textbf{No es un PoR.} Sin códigos de borrado ni extractor, un servidor que pierde un solo
+  bloque pasa la mayoría de las auditorías. Un PoR al estilo Juels-Kaliski o Shacham-Waters codifica
+  el archivo para que perder poco sea irrecuperable y perder mucho sea detectable.
+\item \textbf{Ancho de banda.} Cada bloque consultado viaja entero. Las multipruebas
+  (Boneh-Shoup, Thm~8.7) reducirían los hashes de los caminos, pero el costo lo dominan los bloques.
+  Los autenticadores homomórficos de Shacham-Waters responden con un agregado de tamaño constante.
+\item \textbf{Archivos pequeños.} Por debajo de unos pocos MiB, auditar cuesta tanto como descargar
+  (sección~\ref{sec:exp}). El producto no lo advierte todavía.
+\item \textbf{Confianza en el cliente.} La seguridad descansa en que manifiesto, clave y bitácora no
+  se alteren (S4). La bitácora es solo de inserción a nivel SQLite, pero no está encadenada con
+  hashes: quien controla la máquina del cliente puede reescribirla.
+\item \textbf{Sin actualización dinámica.} Cada cambio del archivo es una versión nueva completa.
+\end{itemize}
+
+% ------------------------------------------------------------------------------------------------
+\section{Reproducibilidad}
+\label{sec:repro}
+
+Desde cero, con \code{uv} instalado: \code{uv sync} crea el entorno con las dependencias fijadas;
+\code{make check} corre lint y tests; \code{make demo} ejecuta la demostración de punta a punta;
+\code{make experiments} regenera los CSV y sus gráficas (unos 10 minutos con $N=1000$);
+\code{make server} y \code{make ui} levantan el servidor y el panel. El README tiene además un guion
+manual paso a paso con el CLI y el inyector de fallos. Todos los datos son sintéticos y salen de una
+semilla; ningún secreto se registra.
+
+% ------------------------------------------------------------------------------------------------
+\begin{thebibliography}{9}\small
+\bibitem{bs23} D.~Boneh y V.~Shoup. \emph{A Graduate Course in Applied Cryptography}, versión 0.6,
+  enero de 2023. §8.1, §8.9 (Def.~8.3, Thm~8.7, Thm~8.8) y Ejercicio 8.9.
+\bibitem{jk07} A.~Juels y B.~S.~Kaliski. PORs: Proofs of Retrievability for Large Files. En
+  \emph{ACM CCS}, 2007.
+\bibitem{sw08} H.~Shacham y B.~Waters. Compact Proofs of Retrievability. En \emph{ASIACRYPT},
+  LNCS 5350, 2008.
+\bibitem{vp} R.~L.~Villanueva-Polanco. \emph{Cryptographic Protocols}, material del curso
+  Criptografía Aplicada, Universidad del Norte, 2026. Págs.~7--9, 43, 49--52, 113, 142, 248--249.
+\bibitem{rfc9162} B.~Laurie, E.~Messeri y R.~Stradling. Certificate Transparency Version 2.0.
+  RFC 9162, 2021.
+\bibitem{rfc2104} H.~Krawczyk, M.~Bellare y R.~Canetti. HMAC: Keyed-Hashing for Message
+  Authentication. RFC 2104, 1997.
+\bibitem{wilson} E.~B.~Wilson. Probable Inference, the Law of Succession, and Statistical
+  Inference. \emph{Journal of the American Statistical Association}, 22(158):209--212, 1927.
+\end{thebibliography}
+
+\end{document}

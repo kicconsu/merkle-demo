@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 500  # MiB; el enunciado pide archivos de hasta 500 MB
+
+[browser]
+gatherUsageStats = false
